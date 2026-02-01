@@ -5,7 +5,7 @@ Huge thanks to @mistwreathed for creating the original version of this tool.
 
 ## Installation
 ```sh
-python -m pip install mio-decomp
+python -m pip install mio_decomp
 mio-decomp version # Verify it installed successfully
 ```
 
