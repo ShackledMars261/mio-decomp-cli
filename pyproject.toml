@@ -1,0 +1,28 @@
+[project]
+name = "mio_decomp"
+authors = [
+    {name = "ShackledMars261"}
+]
+license = {text = "MIT"}
+version = "0.0.1"
+description = "A CLI for decompiling the .gin files from MIO: Memories in Orbit."
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "lz4>=4.4.5",
+    "pydantic>=2.12.5",
+    "rich>=14.3.1",
+    "typer>=0.21.1",
+    "zstandard>=0.25.0",
+]
+
+[project.scripts]
+mio-decomp = "mio_decomp.main:app"
+
+[build-system]
+requires = ["uv_build>=0.9.17,<0.10.0"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "mio_decomp"
+module-root = ""
