@@ -65,6 +65,7 @@ class Enum_single(StrEnum):
     PERSONAL_ASSISTANT = "Personal_assistant"
     UNKNOWN = "Unknown"
     INTRO = "Intro"
+    INTRO_2 = "Intro_2"
     FIRST_ENCOUNTER = "First_encounter"
     RAMBLING = "Rambling"
     CITY = "City"
@@ -79,6 +80,14 @@ class Enum_single(StrEnum):
     AFTERMATH = "Aftermath"
     RETURNED = "Returned"
     PROJECT = "Project"
+    HUB = "Hub"
+    CAPTURED = "Captured"
+    ARENA_HINT = "Arena_hint"
+    AFTER_INVASION = "After_invasion"
+    VAULTS = "Vaults"
+    HUB_LIGHTS_ON = "Hub_lights_on"
+    CAPUCINE = "Capucine"
+    WRITER = "Writer"
 
 
 class HalynAlign(BaseModel):
@@ -227,7 +236,7 @@ class Pair(BaseModel):
 
 
 class SavedEntries(BaseModel):
-    pairs: list[Pair] = [Pair() for _ in range(1668)]
+    pairs: list[Pair] = [Pair() for _ in range(1710)]
 
 
 class Save(BaseModel):
@@ -444,7 +453,10 @@ class SaveParser:
                 lines.extend(self.__serialize_recursive(field_value, new_prefix))
         
         elif isinstance(obj, list):
-            active_items = [item for item in obj if item not in [None, ""]]
+            if prefix == "pairs" and len(obj) > 1:
+                active_items = [obj[0]] + [item for item in obj[1:] if item not in [None, ""] and item.key != ""]
+            else:
+                active_items = [item for item in obj if item not in [None, ""]]
 
             if prefix.endswith("flags") or prefix.endswith("datapad.status"):
                 # print([flag.value for flag in obj])
@@ -491,4 +503,4 @@ class SaveParser:
 if __name__ == "__main__":
     parser: SaveParser = SaveParser()
     # parser.__safe_set_value_by_key("", "", "")
-    print(parser.compile_save(Path(r"test_saves\100_percent.json")))
+    print(parser.compile_save(Path(r"tests\test_saves\100_percent.json")))
