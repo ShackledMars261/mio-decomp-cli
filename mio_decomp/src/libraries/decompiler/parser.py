@@ -70,6 +70,7 @@ class Enum_single(StrEnum):
     CITY = "City"
     HOME = "Home"
     HOUSE2 = "House2"
+    HOUSE3 = "House3"
     CONNECTED_WITH_PEARLS = "Connected_with_pearls"
     NEW_HOME = "New_home"
     KNOWN = "Known"
@@ -226,7 +227,7 @@ class Pair(BaseModel):
 
 
 class SavedEntries(BaseModel):
-    pairs: list[Pair] = [Pair() for _ in range(1638)]
+    pairs: list[Pair] = [Pair() for _ in range(1668)]
 
 
 class Save(BaseModel):
@@ -443,12 +444,14 @@ class SaveParser:
                 lines.extend(self.__serialize_recursive(field_value, new_prefix))
         
         elif isinstance(obj, list):
+            active_items = [item for item in obj if item not in [None, ""]]
+
             if prefix.endswith("flags") or prefix.endswith("datapad.status"):
                 # print([flag.value for flag in obj])
-                lines.append(f'{prefix} = Flags({"" if len(obj) == 0 else "".join(f"\"{flag.value.capitalize()}\"" for flag in obj)})')
+                lines.append(f'{prefix} = Flags({"" if len(active_items) == 0 else "".join(f"\"{flag.value.capitalize()}\"" for flag in active_items)})')
             else:
-                lines.append(f'{prefix} = Array({len(obj)})')
-                for i, item in enumerate(obj):
+                lines.append(f'{prefix} = Array({len(active_items)})')
+                for i, item in enumerate(active_items):
                     if item is None:
                         continue
                     lines.extend(self.__serialize_recursive(item, f"{prefix}.{i}"))
