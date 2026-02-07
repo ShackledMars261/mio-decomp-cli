@@ -13,8 +13,8 @@ u64 = Annotated[int, Field(ge=0, le=MAX_UINT64)]
 
 
 class Flags(StrEnum):
-    Acquired = auto()
-    Equipped = auto()
+    Acquired = "Acquired"
+    Equipped = "Equipped"
 
 
 class f32x2(BaseModel):
@@ -65,11 +65,13 @@ class Enum_single(StrEnum):
     PERSONAL_ASSISTANT = "Personal_assistant"
     UNKNOWN = "Unknown"
     INTRO = "Intro"
+    INTRO_2 = "Intro_2"
     FIRST_ENCOUNTER = "First_encounter"
     RAMBLING = "Rambling"
     CITY = "City"
     HOME = "Home"
     HOUSE2 = "House2"
+    HOUSE3 = "House3"
     CONNECTED_WITH_PEARLS = "Connected_with_pearls"
     NEW_HOME = "New_home"
     KNOWN = "Known"
@@ -78,6 +80,14 @@ class Enum_single(StrEnum):
     AFTERMATH = "Aftermath"
     RETURNED = "Returned"
     PROJECT = "Project"
+    HUB = "Hub"
+    CAPTURED = "Captured"
+    ARENA_HINT = "Arena_hint"
+    AFTER_INVASION = "After_invasion"
+    VAULTS = "Vaults"
+    HUB_LIGHTS_ON = "Hub_lights_on"
+    CAPUCINE = "Capucine"
+    WRITER = "Writer"
 
 
 class HalynAlign(BaseModel):
@@ -193,8 +203,8 @@ class Trinket(BaseModel):
 
 
 class Rebuild(BaseModel):
-    scrap_investment: u32 = 0
     step: u32 = 1
+    scrap_investment: u32 = 0
 
 
 class RebuildNPC(BaseModel):
@@ -202,17 +212,17 @@ class RebuildNPC(BaseModel):
 
 
 class DatapadFlags(StrEnum):
-    UNIMPLEMENTED = auto()  # Not real, but i needed a flag to put here
+    pass # No known datapad flags currently exist, but this is here for future compatibility and to avoid issues with the save file format if they are added in the future.
 
 
 class Datapad(BaseModel):
-    status: DatapadFlags = DatapadFlags.UNIMPLEMENTED
+    status: list[DatapadFlags] = []
     discovery_index: int = 0
     mark_as_read: bool = False
 
 
 class PairValue(BaseModel):
-    flags: list[Flags] = []
+    flags: list[Flags] = [Flags.Acquired]
     count: int = 0
     trinket: Trinket | None = None
     rebuild: Rebuild | None = None
@@ -226,7 +236,7 @@ class Pair(BaseModel):
 
 
 class SavedEntries(BaseModel):
-    pairs: list[Pair] = [Pair() for _ in range(1638)]
+    pairs: list[Pair] = [Pair() for _ in range(1710)]
 
 
 class Save(BaseModel):
@@ -281,32 +291,82 @@ class SaveParser:
     def __init__(self):
         self.save: MIOSave = MIOSave()
 
-    def __convert_value(self, value: str):
-        if value.startswith("i32"):
-            return int(value[4:-1])
-        elif value.startswith("u32"):
-            return int(value[4:-1])
-        elif value.startswith("u64"):
-            return int(value[4:-1])
-        elif value.startswith("String"):
-            return value[8:-2]
-        elif value.startswith("bool"):
-            return value[5] == "t"
-        elif value.startswith("f32x3"):
-            nums: list[float] = [float(n) for n in value[6:-1].split(", ")]
-            return f32x3(*nums)
-        elif value.startswith("f32x2"):
-            nums: list[float] = [float(n) for n in value[6:-1].split(", ")]
-            return f32x2(*nums)
-        elif value.startswith("f32"):
-            return float(value[4:-1])
-        elif value.startswith("f64"):
-            return float(value[4:-1])
-        elif value.startswith("Enum_single"):
-            return Enum_single(value[13:-2])
+    def __convert_value(self, value: str, to_json: bool = True, key: str = None) -> int | float | str | bool | f32x2 | f32x3 | Enum_single:
+        """
+        Converts a value from the save file format to a Python type, or vice versa.
+        
+        Args:
+            value (String): The value to convert.
+            to_json (bool): Whether to convert to JSON or to save file. Default True.
+            key (str): Used in determining u32 vs i32. Only when converting to save file.
+
+        Returns:
+            value in corresponding type, or
+            str: save file format if to_json is False.
+        """
+        if to_json:
+            type: str
+            content: str
+
+            type, content = value[:-1].split("(", 1)
+            content = content.strip('"')
+            match type:
+                case "i32":
+                    return int(content)
+                case "u32":
+                    return int(content)
+                case "u64":
+                    return int(content)
+                case "String":
+                    return content
+                case "bool":
+                    return content == "true"
+                case "f32x3":
+                    return f32x3(*[float(n) for n in content.split(", ")])
+                case "f32x2":
+                    return f32x2(*[float(n) for n in content.split(", ")])
+                case "f32":
+                    return float(content)
+                case "f64":
+                    return float(content)
+                case "Enum_single":
+                    return Enum_single(content)
+                case "Flags":
+                    return [Flags(flag) for flag in content.split('""') if flag]
+                case _:
+                    typer.Abort()
+                    return None
         else:
-            typer.Abort()
-            return None
+            if isinstance(value, bool):
+                return f"bool({str(value).lower()})"
+            if isinstance(value, int):
+                if key is None:
+                    return f"i32({value})"
+                if key == "id":
+                    return f"u64({value})"
+                if key in ["version", "plotpoints.mio.death_after_hub", "factorio.selected_experiment", "nacre_in_hub_basin",  "nacre_buffered_in_hub_basin", "shield_decay_mask", "liquid_nacres_count"]:
+                    return f"u32({value})"
+                keysplit: list[str] = key.split(".")
+                if len(keysplit) > 1 and keysplit[1] in ["markers", "face_inside_bits", "edge_visited_bits"]:
+                    return f"u32({value})"
+                if len(keysplit) > 3 and keysplit[3] in ["rebuild", "rebuild_npc", "trinket"]:
+                    return f"u32({value})"
+                return f"i32({value})"
+            if isinstance(value, float):
+                if key == "last_save_time":
+                    return f"f64({value:.6f})"
+                return f"f32({value:.6f})"
+            if isinstance(value, Enum_single):
+                return f"Enum_single(\"{value.value}\")"
+            if isinstance(value, f32x2):
+                vals = ", ".join(f"{v:.6f}" for v in value.model_dump().values())
+                return f"f32x2({vals})"
+            if isinstance(value, f32x3):
+                vals = ", ".join(f"{v:.6f}" for v in value.model_dump().values())
+                return f"f32x3({vals})"
+            if isinstance(value, str):
+                return f"String(\"{value}\")"
+            return str(value)
 
     def __safe_set_value_by_key(self, group: str, key: str, value: str) -> None:
         if value.startswith("Array"):
@@ -381,8 +441,66 @@ class SaveParser:
                 self.__safe_set_value_by_key(group, key, value)
 
         return self.save.model_dump_json(indent=4, exclude_none=True)
+    
+    def __serialize_recursive(self, obj, prefix="") -> list[str]:
+        lines = []
+        
+        if isinstance(obj, BaseModel) and not isinstance(obj, (f32x2, f32x3)):
+            for field_name, field_value in obj:
+                if field_value is None:
+                    continue
+                new_prefix = f"{prefix}.{field_name}" if prefix else field_name
+                lines.extend(self.__serialize_recursive(field_value, new_prefix))
+        
+        elif isinstance(obj, list):
+            if prefix == "pairs" and len(obj) > 1:
+                active_items = [obj[0]] + [item for item in obj[1:] if item not in [None, ""] and item.key != ""]
+            else:
+                active_items = [item for item in obj if item not in [None, ""]]
 
+            if prefix.endswith("flags") or prefix.endswith("datapad.status"):
+                # print([flag.value for flag in obj])
+                lines.append(f'{prefix} = Flags({"" if len(active_items) == 0 else "".join(f"\"{flag.value.capitalize()}\"" for flag in active_items)})')
+            else:
+                lines.append(f'{prefix} = Array({len(active_items)})')
+                for i, item in enumerate(active_items):
+                    if item is None:
+                        continue
+                    lines.extend(self.__serialize_recursive(item, f"{prefix}.{i}"))
+
+        else:
+            formatted = self.__convert_value(obj, to_json=False, key=prefix)
+            lines.append(f'{prefix} = {formatted}')
+            
+        return lines
+    
+    def compile_save(self, json_path: Path) -> str:
+        """Compiles a MIO json save file back into a MIO save file.
+
+        Args:
+            input_path (Path): Path to the json save file.
+
+        Returns:
+            str: The compiled save file content.
+        """
+        data = json_path.read_text(encoding="utf-8")
+        self.save = MIOSave.model_validate_json(data)
+        
+        final_output = []
+        
+        for block_name in ["save", "saved_entries", "saved_visibility2", "saved_not_important"]:
+            block_data = getattr(self.save, block_name)
+            
+            final_output.append(f"{block_name.capitalize()} {{")
+            
+            content_lines = self.__serialize_recursive(block_data)
+            final_output.extend([f"  {line}" for line in content_lines])
+            
+            final_output.append("}\n")
+
+        return "\n".join(final_output) + "\n" # for some reason they always have an couple of newlines at the end
 
 if __name__ == "__main__":
     parser: SaveParser = SaveParser()
-    parser.__safe_set_value_by_key("", "", "")
+    # parser.__safe_set_value_by_key("", "", "")
+    print(parser.compile_save(Path(r"tests\test_saves\100_percent.json")))
