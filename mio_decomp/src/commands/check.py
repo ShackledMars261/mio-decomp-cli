@@ -4,7 +4,7 @@ from typing import Annotated
 import typer
 from rich import print
 
-from mio_decomp.src.libraries.decompiler.decompiler import GinDecompiler
+from ..._mio_decomp import GinDecompiler
 
 app = typer.Typer()
 
