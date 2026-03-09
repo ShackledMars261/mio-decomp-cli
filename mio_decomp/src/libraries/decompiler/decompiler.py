@@ -244,6 +244,9 @@ class GinDecompiler:
                 checksum=checksum,
             )
 
+            print(f"Header: {header_data}")
+            print(f"Header checksum: {checksum}")
+
             # --- 2. Read Section Table ---
             # Structure: u8 name[64], u64 offset, u32 size, u32 c_size, u32 flags, u32 params[4], u32 ver, char id[16], u64 check[2]
             sect_fmt = GIN_SECTION_HEADER_FORMAT_STRING
@@ -291,6 +294,13 @@ class GinDecompiler:
                 final_data: bytes | None = self.__decompress_data(
                     raw_data, flags, size_uncompressed
                 )
+
+                new_checksum = mmh3.hash_bytes(
+                    key=final_data,  # ty:ignore[invalid-argument-type]
+                    x64arch=True,
+                )
+                print(f"Original checksum: {s_info[8]}")
+                print(f"Computed checksum: {new_checksum}")
 
                 if final_data:
                     # Construct output filename
@@ -645,6 +655,8 @@ class GinDecompiler:
             checksum=b"\x00" * 16,
         )
 
+        print(new_header.main)
+
         sections_data: bytes = b""
         header_length: int = struct.calcsize(GIN_MAIN_HEADER_FORMAT_STRING)
         sections_offset: int = (
@@ -682,23 +694,40 @@ class GinDecompiler:
             )
             sect_header.compressed_size: int = len(compressed_sect_data)
 
-            sect_header.checksum = mmh3.hash_bytes(sect_data)
+            sect_header.checksum = mmh3.hash_bytes(sect_data, x64arch=True)
+
+            print(f"Computed section checksum: {sect_header.checksum}")
 
             new_header.sections[i] = sect_header
             sections_data += compressed_sect_data
             sections_offset += len(compressed_sect_data)
 
-        final_data: bytes = struct.pack(
-            GIN_MAIN_HEADER_FORMAT_STRING,
-            new_header.main.magic,
-            new_header.main.ver,
-            new_header.main.reserved,
-            new_header.main.file_id,
-            new_header.main.reserved_2,
-            new_header.main.file_path,
-            new_header.main.section_count,
-            new_header.main.checksum,
+        # final_data: bytes = struct.pack(
+        # GIN_MAIN_HEADER_FORMAT_STRING,
+        # new_header.main.magic,
+        # new_header.main.ver,
+        # new_header.main.reserved,
+        # new_header.main.file_id,
+        # new_header.main.reserved_2,
+        # new_header.main.file_path,
+        # new_header.main.section_count,
+        # new_header.main.checksum,
+        # )
+        final_data: bytes = b""
+        final_data += new_header.main.magic.to_bytes(length=4, byteorder="little")
+        final_data += new_header.main.ver.to_bytes(length=2, byteorder="little")
+        final_data += new_header.main.reserved
+        final_data += new_header.main.file_id
+        final_data += new_header.main.reserved_2.to_bytes(length=4, byteorder="little")
+        final_data += new_header.main.file_path
+        final_data += new_header.main.section_count.to_bytes(
+            length=4, byteorder="little"
         )
+        final_data += new_header.main.checksum
+
+        print(f"Final data: {final_data}")
+        print(f"Length of final data: {len(final_data)}")
+
         sect_headers_data: bytes = b""
         for i, sect_header in new_header.sections.items():
             sect_headers_data += struct.pack(
@@ -716,14 +745,19 @@ class GinDecompiler:
         final_data += sect_headers_data
 
         final_checksum: bytes = mmh3.hash_bytes(
-            final_data
+            key=final_data,
+            x64arch=True,
         )  # take checksum of main header and section headers
+
+        print(f"Computed file checksum: {final_checksum}")
 
         final_data += sections_data
 
         new_header.main.checksum: bytes = final_checksum
         final_data_with_checksum: bytes = self.__overwrite_bytes(
-            final_data, final_checksum, 296
+            final_data, final_checksum, 294
         )
+
+        print(final_data_with_checksum[:310])
 
         output_file.write_bytes(final_data_with_checksum)
