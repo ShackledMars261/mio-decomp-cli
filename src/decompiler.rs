@@ -1,8 +1,12 @@
-use std::collections::HashMap;
+use std::collections::HashSet;
 use std::fs;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
+use std::sync::Mutex;
+use std::thread;
 
+use memmap2::Mmap;
 use pyo3::exceptions::{PyFileNotFoundError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use rayon::prelude::*;
@@ -61,23 +65,18 @@ fn decompress_data(data: &[u8], flags: Flags, original_size: usize) -> Option<Ve
     }
 }
 
-/// Read up to 512 bytes from `path` starting at `offset`, then scan for either
-/// a null byte or a `.gin` suffix — whichever comes first.  Returns the bytes
-/// up to (but not including) that terminator.
+/// Extract the embedded `.gin` path from an already-mapped byte slice.
 ///
-/// This replaces the original Python implementation that opened the file and
-/// read one byte at a time, which was catastrophically slow at 150 k files.
-fn read_gin_path_from_binary(path: &Path) -> Option<String> {
-    let mut f = fs::File::open(path).ok()?;
-    f.seek(SeekFrom::Start(GIN_PATH_OFFSET as u64)).ok()?;
-
-    let mut buf = [0u8; 512];
-    let n = f.read(&mut buf).ok()?;
-    let buf = &buf[..n];
-
-    // Find the end: null byte or the first position after ".gin"
-    let mut end = buf.len();
-    for i in 0..buf.len() {
+/// Called while the file is already mmap'd in `decompile_file_inner`, so no
+/// second file open is needed.  Also used standalone during classification for
+/// files whose path was not captured at decompile time.
+fn extract_gin_path_from_slice(data: &[u8]) -> Option<String> {
+    if data.len() <= GIN_PATH_OFFSET {
+        return None;
+    }
+    let buf = &data[GIN_PATH_OFFSET..];
+    let mut end = buf.len().min(512);
+    for i in 0..end {
         if buf[i] == 0 {
             end = i;
             break;
@@ -87,8 +86,19 @@ fn read_gin_path_from_binary(path: &Path) -> Option<String> {
             break;
         }
     }
-
     String::from_utf8(buf[..end].to_vec()).ok()
+}
+
+/// Strip the Windows extended-length path prefix (`\\?\`) that
+/// `canonicalize()` adds on Windows, so paths written to mappings.json are
+/// clean `C:\...` paths.
+fn strip_unc_prefix(p: PathBuf) -> PathBuf {
+    let s = p.to_string_lossy();
+    if let Some(stripped) = s.strip_prefix(r"\\?\") {
+        PathBuf::from(stripped)
+    } else {
+        p
+    }
 }
 
 /// Remove all extensions from a path stem.
@@ -100,8 +110,7 @@ fn remove_all_suffixes(p: &Path) -> PathBuf {
     p
 }
 
-/// Strip extensions until the `.gin` extension is the current one (i.e. the
-/// next strip would remove `.gin`).
+/// Strip extensions until `.gin` is the current extension.
 fn remove_suffix_until_gin(p: &Path) -> PathBuf {
     let mut p = p.to_path_buf();
     while p.extension().is_some() && p.extension().unwrap() != "gin" {
@@ -123,35 +132,40 @@ fn get_suffixes_after_gin(p: &Path) -> Vec<String> {
     suffixes
 }
 
-/// Recursively collect all files under `dir`.
+/// Parallel recursive directory walk using `jwalk`.
 fn walk_dir(dir: &Path) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    if let Ok(entries) = fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                out.extend(walk_dir(&path));
-            } else {
-                out.push(path.canonicalize().unwrap_or(path));
-            }
-        }
-    }
-    out
+    jwalk::WalkDir::new(dir)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+        .map(|e| strip_unc_prefix(e.path()))
+        .collect()
 }
 
 /// Returns true if `path` is a valid Windows file path and is not equal to
-/// `base_dir`.  This replaces the `pathvalidate` Python dependency.
+/// `base_dir`.  Replaces the `pathvalidate` Python dependency.
 fn is_valid_windows_path(path: &Path, base_dir: &Path) -> bool {
     if path == base_dir {
         return false;
     }
     let s = path.to_string_lossy();
-    // Reject paths with characters that are illegal on Windows.
     const ILLEGAL: &[char] = &['"', '<', '>', '|', '?', '*'];
     !s.chars().any(|c| ILLEGAL.contains(&c))
 }
 
-// ─── Section descriptor (parsed from the section table) ──────────────────────
+/// Build a destination path from a ship directory and a raw gin path string,
+/// without calling `canonicalize()`.
+///
+/// `canonicalize()` makes a syscall per file to verify the path exists on
+/// disk, which is 150 k unnecessary syscalls.  Since we construct paths from
+/// known-absolute base directories we can just join and normalise manually.
+fn build_dest_path(base: &Path, relative: &str) -> PathBuf {
+    // Normalise any forward-slash separators the embedded path may contain.
+    let normalised = relative.replace('/', std::path::MAIN_SEPARATOR_STR);
+    base.join(normalised)
+}
+
+// ─── Section descriptor ───────────────────────────────────────────────────────
 
 struct SectionInfo {
     name: String,
@@ -161,19 +175,45 @@ struct SectionInfo {
     flags: Flags,
 }
 
+// ─── Write task sent from worker threads to the I/O thread ───────────────────
+
+struct WriteTask {
+    path: PathBuf,
+    data: Vec<u8>,
+}
+
 // ─── Core decompiler ─────────────────────────────────────────────────────────
 
 /// Parse and decompile a single `.gin` file.
 ///
-/// Returns a list of output file paths (as strings) that were written.
+/// Optimisations applied here:
+/// - `memmap2`: file is memory-mapped rather than heap-allocated, letting the
+///   OS page data in on demand and reducing peak RSS when many files are
+///   decompiled in parallel.
+/// - Parallel section extraction: decompression (CPU-bound) runs on Rayon
+///   worker threads; completed `WriteTask`s are sent to a dedicated I/O
+///   thread via a channel, decoupling decompression from write latency.
+/// - The embedded gin path is read from the mmap'd data directly, so the
+///   classification step in `decompile_to_structure` does not need to
+///   re-open the file.
+///
+/// Returns `(output_paths, gin_path_map)` where `gin_path_map` maps each
+/// output `PathBuf` to the embedded gin path string found inside that section
+/// (if any).  This is consumed by `decompile_to_structure` to avoid a second
+/// file open per output file.
 pub fn decompile_file_inner(
     file_path: &Path,
     output_dir: &Path,
     file_count_offset: usize,
     include_number_prefix: bool,
     silent: bool,
-) -> PyResult<Vec<PathBuf>> {
-    let data = fs::read(file_path).map_err(|e| PyFileNotFoundError::new_err(e.to_string()))?;
+) -> PyResult<(Vec<PathBuf>, Vec<Option<String>>)> {
+    // --- Memory-map the input file ---
+    let file =
+        fs::File::open(file_path).map_err(|e| PyFileNotFoundError::new_err(e.to_string()))?;
+
+    // SAFETY: we treat the mapping as read-only and do not truncate the file.
+    let data = unsafe { Mmap::map(&file) }.map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
     if data.len() < HEADER_SIZE {
         return Err(PyValueError::new_err("File too small to be a .gin file"));
@@ -187,7 +227,6 @@ pub fn decompile_file_inner(
 
     // --- 2. Read section count ---
     let section_count = read_u32_le(&data, HEADER_SECTION_COUNT_OFFSET) as usize;
-
     if !silent {
         println!("Found {} sections. Starting extraction...\n", section_count);
     }
@@ -198,90 +237,135 @@ pub fn decompile_file_inner(
         return Err(PyValueError::new_err("File truncated in section table"));
     }
 
-    let mut sections: Vec<SectionInfo> = Vec::with_capacity(section_count);
-    for i in 0..section_count {
-        let base = table_start + i * SECT_ENTRY_SIZE;
-        let name_bytes = &data[base..base + SECT_NAME_SIZE];
-        let name = read_cstr(name_bytes);
-        let offset = read_u64_le(&data, base + SECT_OFFSET_OFF);
-        let size_uncompressed = read_u32_le(&data, base + SECT_SIZE_OFF) as usize;
-        let size_compressed = read_u32_le(&data, base + SECT_CSIZE_OFF) as usize;
-        let flags_raw = read_u32_le(&data, base + SECT_FLAGS_OFF);
-        let flags = Flags::from_bits_truncate(flags_raw);
+    let sections: Vec<SectionInfo> = (0..section_count)
+        .map(|i| {
+            let base = table_start + i * SECT_ENTRY_SIZE;
+            SectionInfo {
+                name: read_cstr(&data[base..base + SECT_NAME_SIZE]),
+                offset: read_u64_le(&data, base + SECT_OFFSET_OFF),
+                size_uncompressed: read_u32_le(&data, base + SECT_SIZE_OFF) as usize,
+                size_compressed: read_u32_le(&data, base + SECT_CSIZE_OFF) as usize,
+                flags: Flags::from_bits_truncate(read_u32_le(&data, base + SECT_FLAGS_OFF)),
+            }
+        })
+        .collect();
 
-        sections.push(SectionInfo {
-            name,
-            offset,
-            size_uncompressed,
-            size_compressed,
-            flags,
-        });
-    }
-
-    // --- 4. Extract sections ---
+    // --- 4. Extract sections (parallel decompress + pipelined I/O) ---
     fs::create_dir_all(output_dir).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
-    let mut output_paths: Vec<PathBuf> = Vec::new();
-
-    for (i, section) in sections.iter().enumerate() {
-        let read_size = if section.size_compressed > 0 {
-            section.size_compressed
-        } else {
-            section.size_uncompressed
-        };
-
-        let start = section.offset as usize;
-        let end = start + read_size;
-
-        if end > data.len() {
-            if !silent {
-                eprintln!("    [!] Section {} data out of bounds, skipping", i);
+    // Spawn a dedicated I/O thread that drains the channel and writes files.
+    // This decouples CPU-bound decompression from disk write latency: Rayon
+    // workers never block waiting for a write to complete.
+    let (tx, rx) = mpsc::channel::<WriteTask>();
+    let io_thread = thread::spawn(move || {
+        let mut write_errors: Vec<String> = Vec::new();
+        for task in rx {
+            if let Err(e) = fs::write(&task.path, &task.data) {
+                write_errors.push(format!("{}: {}", task.path.display(), e));
             }
-            continue;
         }
+        write_errors
+    });
 
-        let raw_data = &data[start..end];
-
-        let final_data = match decompress_data(raw_data, section.flags, section.size_uncompressed) {
-            Some(d) => d,
-            None => {
-                if !silent {
-                    eprintln!("    [!] Decompression failed for section {}", i);
-                }
-                continue;
-            }
-        };
-
-        let safe_name = safe_filename(&section.name);
-        let out_name = if include_number_prefix {
-            format!("{:04}_{}", i + file_count_offset, safe_name)
-        } else {
-            safe_name.clone()
-        };
-
-        let out_path = output_dir.join(&out_name);
-        fs::write(&out_path, &final_data).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-
-        if !silent {
-            let comp_tag = if section.flags.contains(Flags::ZSTD) {
-                "[ZSTD]"
-            } else if section.flags.contains(Flags::LZ4) {
-                "[LZ4]"
+    // Decompress all sections in parallel. Each section produces either a
+    // WriteTask (sent to the I/O thread) or nothing (on error / OOB).
+    // We collect (index, out_path, gin_path) for every successfully queued
+    // section so we can return a stable ordered list.
+    let section_results: Vec<Option<(usize, PathBuf, Option<String>)>> = sections
+        .par_iter()
+        .enumerate()
+        .map(|(i, section)| {
+            let read_size = if section.size_compressed > 0 {
+                section.size_compressed
             } else {
-                "[RAW]"
+                section.size_uncompressed
             };
-            println!(
-                "Extracted: {} {} ({} bytes)",
-                out_name,
-                comp_tag,
-                final_data.len()
-            );
-        }
 
-        output_paths.push(out_path);
+            let start = section.offset as usize;
+            let end = start + read_size;
+
+            if end > data.len() {
+                if !silent {
+                    eprintln!("    [!] Section {} data out of bounds, skipping", i);
+                }
+                return None;
+            }
+
+            let raw_data = &data[start..end];
+
+            let final_data =
+                match decompress_data(raw_data, section.flags, section.size_uncompressed) {
+                    Some(d) => d,
+                    None => {
+                        if !silent {
+                            eprintln!("    [!] Decompression failed for section {}", i);
+                        }
+                        return None;
+                    }
+                };
+
+            // Extract the embedded gin path from the decompressed data while
+            // we already have it in memory, avoiding a second file open in
+            // the structuring step.
+            let gin_path = extract_gin_path_from_slice(&final_data);
+
+            let safe_name = safe_filename(&section.name);
+            let out_name = if include_number_prefix {
+                format!("{:04}_{}", i + file_count_offset, safe_name)
+            } else {
+                safe_name
+            };
+
+            if !silent {
+                let comp_tag = if section.flags.contains(Flags::ZSTD) {
+                    "[ZSTD]"
+                } else if section.flags.contains(Flags::LZ4) {
+                    "[LZ4]"
+                } else {
+                    "[RAW]"
+                };
+                println!(
+                    "Extracted: {} {} ({} bytes)",
+                    out_name,
+                    comp_tag,
+                    final_data.len()
+                );
+            }
+
+            let out_path = output_dir.join(&out_name);
+            Some((i, out_path, gin_path, final_data))
+        })
+        // Send write tasks to the I/O thread and strip the data field.
+        .map(|opt| {
+            opt.map(|(i, out_path, gin_path, final_data)| {
+                tx.send(WriteTask {
+                    path: out_path.clone(),
+                    data: final_data,
+                })
+                .ok(); // I/O thread dropped = channel closed; ignore
+                (i, out_path, gin_path)
+            })
+        })
+        .collect();
+
+    // Drop the sender so the I/O thread's recv loop terminates.
+    drop(tx);
+
+    // Wait for all writes to finish and surface any errors.
+    let write_errors = io_thread.join().unwrap_or_default();
+    if !write_errors.is_empty() {
+        return Err(PyRuntimeError::new_err(write_errors.join("\n")));
     }
 
-    Ok(output_paths)
+    // Collect results in section order (parallel iter may reorder).
+    let mut indexed: Vec<(usize, PathBuf, Option<String>)> =
+        section_results.into_iter().flatten().collect();
+    indexed.sort_unstable_by_key(|(i, _, _)| *i);
+
+    let output_paths: Vec<PathBuf> = indexed.iter().map(|(_, p, _)| p.clone()).collect();
+    let gin_paths: Vec<Option<String>> = indexed.into_iter().map(|(_, _, g)| g).collect();
+
+    Ok((output_paths, gin_paths))
 }
 
 // ─── PyO3 wrappers ────────────────────────────────────────────────────────────
@@ -299,7 +383,6 @@ impl GinDecompiler {
         GinDecompiler { silent }
     }
 
-    /// Returns `True` if the file at `file_path` has a valid .gin magic number.
     fn check_if_gin_file(&self, file_path: PathBuf) -> PyResult<bool> {
         if !file_path.exists() {
             return Err(PyFileNotFoundError::new_err(format!(
@@ -316,9 +399,6 @@ impl GinDecompiler {
         Ok(u32::from_le_bytes(buf) == GIN_MAGIC_NUMBER)
     }
 
-    /// Decompile a single `.gin` file into `output_dir`.
-    ///
-    /// Returns a list of output file path strings.
     #[pyo3(signature = (file_path, output_dir, file_count_offset = 0, include_number_prefix = true))]
     fn decompile_file(
         &self,
@@ -327,7 +407,7 @@ impl GinDecompiler {
         file_count_offset: usize,
         include_number_prefix: bool,
     ) -> PyResult<Vec<String>> {
-        let paths = decompile_file_inner(
+        let (paths, _) = decompile_file_inner(
             &file_path,
             &output_dir,
             file_count_offset,
@@ -340,9 +420,6 @@ impl GinDecompiler {
             .collect())
     }
 
-    /// Decompile multiple `.gin` files into subdirectories of `output_dir`.
-    ///
-    /// Returns a list of all output file path strings.
     #[pyo3(signature = (input_paths, output_dir, include_number_prefix = true))]
     fn decompile_multi(
         &self,
@@ -351,22 +428,28 @@ impl GinDecompiler {
         include_number_prefix: bool,
     ) -> PyResult<Vec<String>> {
         if output_dir.exists() {
-            fs::remove_dir_all(output_dir.clone())
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            fs::remove_dir_all(&output_dir).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         }
         fs::create_dir_all(&output_dir).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
-        // Validate and filter input paths
-        let valid_paths: Vec<PathBuf> = input_paths
+        let mut valid_paths: Vec<PathBuf> = input_paths
             .into_iter()
-            .filter_map(|p| {
+            .filter(|p| {
                 if !p.exists() || !p.is_file() {
-                    return None;
+                    if !self.silent {
+                        eprintln!("Skipping \"{}\": not a readable file", p.display());
+                    }
+                    return false;
                 }
-                match self.check_if_gin_file(p.clone()).ok()? {
-                    true => Some(p),
-                    false => None,
+                let mut buf = [0u8; 4];
+                let ok = fs::File::open(p)
+                    .and_then(|mut f| f.read_exact(&mut buf))
+                    .map(|_| u32::from_le_bytes(buf) == GIN_MAGIC_NUMBER)
+                    .unwrap_or(false);
+                if !ok && !self.silent {
+                    eprintln!("Skipping \"{}\": not a .gin file", p.display());
                 }
+                ok
             })
             .collect();
 
@@ -376,41 +459,62 @@ impl GinDecompiler {
             ));
         }
 
-        let mut all_output_paths: Vec<String> = Vec::new();
-        let mut file_count_offset = 0usize;
+        valid_paths.sort();
 
         for file in &valid_paths {
-            let file_output_dir = output_dir.join(file.file_stem().unwrap_or_default());
-            fs::create_dir_all(&file_output_dir)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-
-            if !self.silent {
-                println!("Decompiling \"{}\"...", file.display());
-            }
-
-            let paths = decompile_file_inner(
-                file,
-                &file_output_dir,
-                file_count_offset,
-                include_number_prefix,
-                self.silent,
-            )?;
-
-            file_count_offset += paths.len();
-            for p in paths {
-                all_output_paths.push(p.to_string_lossy().into_owned());
-            }
+            let dir = output_dir.join(file.file_stem().unwrap_or_default());
+            fs::create_dir_all(&dir).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         }
 
-        Ok(all_output_paths)
+        let silent = self.silent;
+
+        if include_number_prefix {
+            // Sequential: offsets must be stable.
+            let mut offset = 0usize;
+            let mut all: Vec<String> = Vec::new();
+            for file in &valid_paths {
+                let dir = output_dir.join(file.file_stem().unwrap_or_default());
+                if !silent {
+                    println!("Decompiling \"{}\"...", file.display());
+                }
+                let (paths, _) = decompile_file_inner(file, &dir, offset, true, silent)?;
+                offset += paths.len();
+                all.extend(paths.into_iter().map(|p| p.to_string_lossy().into_owned()));
+            }
+            Ok(all)
+        } else {
+            // Fully parallel.
+            let errors: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+            let results: Vec<Vec<String>> = valid_paths
+                .par_iter()
+                .map(|file| {
+                    let dir = output_dir.join(file.file_stem().unwrap_or_default());
+                    if !silent {
+                        println!("Decompiling \"{}\"...", file.display());
+                    }
+                    match decompile_file_inner(file, &dir, 0, false, silent) {
+                        Ok((paths, _)) => paths
+                            .into_iter()
+                            .map(|p| p.to_string_lossy().into_owned())
+                            .collect(),
+                        Err(e) => {
+                            errors.lock().unwrap().push(e.to_string());
+                            vec![]
+                        }
+                    }
+                })
+                .collect();
+
+            let errs = errors.into_inner().unwrap();
+            if !errs.is_empty() {
+                return Err(PyRuntimeError::new_err(errs.join("\n")));
+            }
+
+            Ok(results.into_iter().flatten().collect())
+        }
     }
 
-    /// Full pipeline: decompile all `.gin` files then organise the output into
-    /// a human-readable directory structure and emit a `mappings.json`.
-    ///
-    /// This method parallelises both the path-reading step and the file-copy
-    /// step using Rayon, replacing the sequential Python implementation that
-    /// was catastrophically slow at ~150 k files.
     #[pyo3(signature = (input_paths, output_dir))]
     fn decompile_to_structure(
         &self,
@@ -429,29 +533,72 @@ impl GinDecompiler {
         fs::create_dir_all(&temp_dir).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         fs::create_dir_all(&ship_dir).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
-        // --- Step 1: Decompile all .gin files into temp_dir ---
-        self.decompile_multi(input_paths, temp_dir.clone(), false)?;
+        // --- Step 1: Parallel decompile, capturing embedded gin paths ---
+        // We run decompile_multi manually here so we can harvest the gin path
+        // map from decompile_file_inner without a second file open.
+        let mut valid_paths: Vec<PathBuf> = input_paths
+            .into_iter()
+            .filter(|p| {
+                if !p.exists() || !p.is_file() {
+                    return false;
+                }
+                let mut buf = [0u8; 4];
+                fs::File::open(p)
+                    .and_then(|mut f| f.read_exact(&mut buf))
+                    .map(|_| u32::from_le_bytes(buf) == GIN_MAGIC_NUMBER)
+                    .unwrap_or(false)
+            })
+            .collect();
 
-        // --- Step 2: Walk temp_dir and collect all files ---
-        let decompiled_paths = walk_dir(&temp_dir);
-        println!("Structuring {} files...", decompiled_paths.len());
+        if valid_paths.is_empty() {
+            return Err(PyValueError::new_err(
+                "No .gin files found. Please select at least one .gin file.",
+            ));
+        }
 
-        // --- Step 3: Classify each file in parallel ---
-        // Each file is either "skipped" (reloc/alloc/assets metadata) or
-        // "placed" (needs a destination path derived from the embedded gin path).
+        valid_paths.sort();
+
+        for file in &valid_paths {
+            fs::create_dir_all(temp_dir.join(file.file_stem().unwrap_or_default())).ok();
+        }
+
+        let silent = self.silent;
+
+        // Collect (output_path, embedded_gin_path) for every extracted section.
+        // This map is used in the classification step below so we never need to
+        // re-open any output file.
+        let decompile_results: Vec<(PathBuf, Option<String>)> = valid_paths
+            .par_iter()
+            .flat_map(|file| {
+                let dir = temp_dir.join(file.file_stem().unwrap_or_default());
+                match decompile_file_inner(file, &dir, 0, false, silent) {
+                    Ok((paths, gin_paths)) => paths
+                        .into_iter()
+                        .zip(gin_paths.into_iter())
+                        .collect::<Vec<_>>(),
+                    Err(_) => vec![],
+                }
+            })
+            .collect();
+
+        println!("Structuring {} files...", decompile_results.len());
+
+        // --- Step 2: Classify each file in parallel ---
+        // Using the pre-captured gin paths avoids re-opening every file.
         //
-        // We do the expensive read_gin_path_from_binary calls in parallel here.
+        // dest paths are built with `build_dest_path` instead of
+        // `canonicalize()`, saving one syscall per file.
         #[derive(Debug)]
         enum Classification {
             Skip,
-            Place(PathBuf), // resolved destination path
+            Place(PathBuf),
         }
 
         let ship_dir_ref = &ship_dir;
 
-        let classified: Vec<(PathBuf, Classification)> = decompiled_paths
+        let classified: Vec<(PathBuf, Classification)> = decompile_results
             .par_iter()
-            .map(|path| {
+            .map(|(path, embedded_gin_path)| {
                 let ext = path
                     .extension()
                     .unwrap_or_default()
@@ -477,14 +624,11 @@ impl GinDecompiler {
                         .join("fonts")
                         .join(path.file_name().unwrap_or_default())
                 } else {
-                    // Read the embedded gin path from the file's binary data.
-                    match read_gin_path_from_binary(path) {
-                        Some(gin_path) => ship_dir_ref.join(&gin_path),
+                    match embedded_gin_path {
+                        Some(gin_path) => build_dest_path(ship_dir_ref, gin_path),
                         None => ship_dir_ref.join(path.file_name().unwrap_or_default()),
                     }
                 };
-
-                let dest = dest.canonicalize().unwrap_or_else(|_| dest.clone());
 
                 if is_valid_windows_path(&dest, ship_dir_ref) {
                     (path.clone(), Classification::Place(dest))
@@ -494,13 +638,9 @@ impl GinDecompiler {
             })
             .collect();
 
-        // --- Step 4: Copy "placed" files in parallel, collect skipped ---
-        // We need the structure_mappings for the skipped-file resolution step
-        // below, so we build it while copying.
-        let mut structure_mappings: HashMap<PathBuf, PathBuf> = HashMap::new();
+        // --- Step 3: Partition, deduplicate dirs, parallel copy ---
         let mut skipped_paths: Vec<PathBuf> = Vec::new();
 
-        // Separate placed from skipped so we can parallelise the copies.
         let (to_place, to_skip): (Vec<_>, Vec<_>) = classified
             .into_iter()
             .partition(|(_, c)| matches!(c, Classification::Place(_)));
@@ -509,114 +649,134 @@ impl GinDecompiler {
             skipped_paths.push(path);
         }
 
-        // Create all destination directories up front (must be sequential).
-        for (_, classification) in &to_place {
-            if let Classification::Place(dest) = classification {
-                if let Some(parent) = dest.parent() {
-                    fs::create_dir_all(parent).ok();
+        // Deduplicate parent directories before creating them.
+        let unique_dirs: HashSet<PathBuf> = to_place
+            .iter()
+            .filter_map(|(_, c)| {
+                if let Classification::Place(dest) = c {
+                    dest.parent().map(PathBuf::from)
+                } else {
+                    None
                 }
-            }
+            })
+            .collect();
+
+        for dir in &unique_dirs {
+            fs::create_dir_all(dir).ok();
         }
 
-        // Parallel copy.
-        let copy_results: Vec<(PathBuf, PathBuf, Result<(), _>)> = to_place
+        // Parallel copy — collect (src, dest, ok) triples.
+        let copy_results: Vec<(PathBuf, PathBuf, bool)> = to_place
             .par_iter()
             .map(|(src, classification)| {
                 if let Classification::Place(dest) = classification {
-                    let result = fs::copy(src, dest).map(|_| ());
-                    (src.clone(), dest.clone(), result)
+                    let ok = fs::copy(src, dest).is_ok();
+                    (src.clone(), dest.clone(), ok)
                 } else {
                     unreachable!()
                 }
             })
             .collect();
 
-        for (src, dest, result) in copy_results {
-            if result.is_ok() {
-                structure_mappings.insert(src, dest);
-            }
-        }
+        // Build structure_mappings as a sorted Vec for cache-friendly binary
+        // search in Step 4, rather than a HashMap.
+        let mut structure_mappings: Vec<(PathBuf, PathBuf)> = copy_results
+            .into_iter()
+            .filter_map(|(src, dest, ok)| if ok { Some((src, dest)) } else { None })
+            .collect();
+        structure_mappings.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
 
-        // --- Step 5: Resolve skipped (reloc/alloc) files ---
-        // Each skipped file must be matched to its parent .gin file in
-        // structure_mappings so it can be placed next to it in ship_dir.
-        for path in &skipped_paths {
-            // Special-case for the one known-broken filename.
-            if path.file_name().unwrap_or_default()
-                == "ST_factory_factory_pearl.ST_factory_turning_stop_pearl_inverted"
-            {
-                let matched = path
-                    .parent()
-                    .unwrap()
-                    .join("ST_factory_factory_pearl.ST_factory_turning_stop_pearl.gin");
-                if let Some(mapped) = structure_mappings.get(&matched) {
-                    let dest = mapped.parent().unwrap().join(format!(
-                        "{}.ST_factory_turning_stop_pearl_inverted",
-                        mapped
-                            .with_extension("")
-                            .file_name()
-                            .unwrap()
-                            .to_string_lossy()
-                    ));
-                    fs::copy(path, &dest).ok();
-                    structure_mappings.insert(path.clone(), dest);
+        // Binary search helper.
+        let find_mapping = |key: &Path| -> Option<&PathBuf> {
+            structure_mappings
+                .binary_search_by(|(k, _)| k.as_path().cmp(key))
+                .ok()
+                .map(|idx| &structure_mappings[idx].1)
+        };
+
+        // --- Step 4: Resolve skipped (reloc/alloc) files in parallel ---
+        // Each skipped file is matched against the sorted mappings via binary
+        // search, then copied to its final destination.
+        let skip_results: Vec<Option<(PathBuf, PathBuf)>> = skipped_paths
+            .par_iter()
+            .map(|path| {
+                // Special-case for the one known-broken filename.
+                if path.file_name().unwrap_or_default()
+                    == "ST_factory_factory_pearl.ST_factory_turning_stop_pearl_inverted"
+                {
+                    let matched = path
+                        .parent()
+                        .unwrap()
+                        .join("ST_factory_factory_pearl.ST_factory_turning_stop_pearl.gin");
+                    if let Some(mapped) = find_mapping(&matched) {
+                        let dest = mapped.parent().unwrap().join(format!(
+                            "{}.ST_factory_turning_stop_pearl_inverted",
+                            mapped
+                                .with_extension("")
+                                .file_name()
+                                .unwrap()
+                                .to_string_lossy()
+                        ));
+                        fs::copy(path, &dest).ok();
+                        return Some((path.clone(), dest));
+                    }
+                    return None;
                 }
-                continue;
-            }
 
-            let no_ext_path = remove_all_suffixes(path);
-            let gin_path = {
-                let mut p = remove_suffix_until_gin(path);
-                // p is now e.g. foo.gin — add the .gin extension explicitly
-                if p.extension().unwrap_or_default() != "gin" {
-                    p.set_extension("gin");
-                }
-                p
-            };
-
-            let (matched_path, file_suffixes): (PathBuf, Vec<String>) =
-                if structure_mappings.contains_key(&gin_path) {
-                    let suffixes = {
-                        let mut s = vec![".gin".to_string()];
-                        s.extend(get_suffixes_after_gin(path));
-                        s
-                    };
-                    (gin_path, suffixes)
-                } else if structure_mappings.contains_key(&no_ext_path) {
-                    (no_ext_path, get_suffixes_after_gin(path))
-                } else {
-                    println!("NO MATCH FOUND. {}", path.display());
-                    continue;
+                let no_ext_path = remove_all_suffixes(path);
+                let gin_path = {
+                    let mut p = remove_suffix_until_gin(path);
+                    if p.extension().unwrap_or_default() != "gin" {
+                        p.set_extension("gin");
+                    }
+                    p
                 };
 
-            let ending_extension = file_suffixes.join("");
-            if let Some(mapped) = structure_mappings.get(&matched_path) {
-                let dest = mapped.parent().unwrap().join(format!(
-                    "{}{}",
-                    mapped.file_stem().unwrap().to_string_lossy(),
-                    ending_extension
-                ));
-                fs::copy(path, &dest).ok();
-                structure_mappings.insert(path.clone(), dest);
-            }
-        }
+                let (matched_path, file_suffixes): (PathBuf, Vec<String>) =
+                    if find_mapping(&gin_path).is_some() {
+                        let mut s = vec![".gin".to_string()];
+                        s.extend(get_suffixes_after_gin(path));
+                        (gin_path, s)
+                    } else if find_mapping(&no_ext_path).is_some() {
+                        (no_ext_path, get_suffixes_after_gin(path))
+                    } else {
+                        println!("NO MATCH FOUND. {}", path.display());
+                        return None;
+                    };
 
-        // --- Step 6: Write mappings.json ---
-        let mut mappings_sorted: Vec<(String, String)> = structure_mappings
-            .iter()
-            .map(|(k, v)| {
-                (
-                    k.to_string_lossy().into_owned(),
-                    v.to_string_lossy().into_owned(),
-                )
+                if let Some(mapped) = find_mapping(&matched_path) {
+                    let dest = mapped.parent().unwrap().join(format!(
+                        "{}{}",
+                        mapped.file_stem().unwrap().to_string_lossy(),
+                        file_suffixes.join("")
+                    ));
+                    fs::copy(path, &dest).ok();
+                    Some((path.clone(), dest))
+                } else {
+                    None
+                }
             })
             .collect();
-        mappings_sorted.sort_by(|a, b| a.0.cmp(&b.0));
 
-        let json_obj: serde_json::Value = serde_json::Value::Object(
-            mappings_sorted
+        // Merge skip results into structure_mappings and re-sort.
+        for entry in skip_results.into_iter().flatten() {
+            structure_mappings.push(entry);
+        }
+        structure_mappings.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
+
+        // --- Step 5: Write mappings.json ---
+        // structure_mappings is already sorted, so we just iterate it.
+        let json_obj = serde_json::Value::Object(
+            structure_mappings
                 .into_iter()
-                .map(|(k, v)| (k, serde_json::Value::String(v)))
+                .map(|(k, v)| {
+                    (
+                        strip_unc_prefix(k).to_string_lossy().into_owned(),
+                        serde_json::Value::String(
+                            strip_unc_prefix(v).to_string_lossy().into_owned(),
+                        ),
+                    )
+                })
                 .collect(),
         );
 

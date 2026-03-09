@@ -4,7 +4,7 @@ authors = [
     {name = "ShackledMars261"}
 ]
 license = {text = "MIT"}
-version = "0.3.1"
+version = "0.3.2"
 description = "A CLI for decompiling the .gin files from MIO: Memories in Orbit."
 readme = "README.md"
 requires-python = ">=3.13"

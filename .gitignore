@@ -213,6 +213,7 @@ Cargo.lock
 # Maturin build artifacts
 *.pyd
 *.pyi.bak
+*.pdb
 
 # Custom
 config.json
