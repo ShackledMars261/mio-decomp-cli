@@ -3,6 +3,7 @@ import typer
 from .commands.check import app as check_app
 from .commands.config import app as config_app
 from .commands.decompile import app as decompile_app
+from .commands.recompile import app as recompile_app
 from .commands.save_parse import app as save_parse_app
 from .commands.version import app as version_app
 from .commands.version import print_version_basic
@@ -17,6 +18,7 @@ app = typer.Typer(
 app.add_typer(check_app)
 app.add_typer(config_app, name="config")
 app.add_typer(decompile_app)
+app.add_typer(recompile_app)
 app.add_typer(save_parse_app)
 app.add_typer(version_app)
 
