@@ -88,6 +88,8 @@ class Enum_single(StrEnum):
     HUB_LIGHTS_ON = "Hub_lights_on"
     CAPUCINE = "Capucine"
     WRITER = "Writer"
+    WORKING = "Working"
+    WORKSHOP = "Workshop"
 
 
 class HalynAlign(BaseModel):
