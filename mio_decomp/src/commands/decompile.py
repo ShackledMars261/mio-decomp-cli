@@ -5,7 +5,9 @@ import typer
 from rich import print
 
 from mio_decomp.src.config import config
-from mio_decomp.src.libraries.decompiler.decompiler import GinDecompiler
+
+# from mio_decomp.src.libraries.decompiler.decompiler import GinDecompiler
+from ..._mio_decomp import GinDecompiler
 
 app = typer.Typer()
 
@@ -89,9 +91,10 @@ def decompile(
     decompiler: GinDecompiler = GinDecompiler(silent=not debug)
     if structure:
         decompiler.decompile_to_structure(
-            input_paths=final_input_paths, output_dir=output_dir
+            input_paths=final_input_paths,  # ty:ignore[invalid-argument-type]
+            output_dir=output_dir,
         )
     else:
-        decompiler.decompile_multi(input_paths=final_input_paths, output_dir=output_dir)
+        decompiler.decompile_multi(input_paths=final_input_paths, output_dir=output_dir)  # ty:ignore[invalid-argument-type]
 
     print("Done!")

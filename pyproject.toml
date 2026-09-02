@@ -4,7 +4,7 @@ authors = [
     {name = "ShackledMars261"}
 ]
 license = {text = "MIT"}
-version = "0.3.1"
+version = "0.3.2"
 description = "A CLI for decompiling the .gin files from MIO: Memories in Orbit."
 readme = "README.md"
 requires-python = ">=3.13"
@@ -19,16 +19,26 @@ dependencies = [
 keywords = ["decompile", "decompiler", "mio", "memories-in-orbit"]
 
 [project.urls]
-Homepage = "https://github.com/ShackledMars261/mio-decomp-cli"
-"Bug Tracker" = "https://github.com/ShackledMars261/mio-decomp-cli/issues"
+Homepage = "https://github.com/MIO-Modding/mio-decomp-cli"
+"Bug Tracker" = "https://github.com/MIO-Modding/mio-decomp-cli/issues"
 
 [project.scripts]
 mio-decomp = "mio_decomp.main:app"
 
 [build-system]
-requires = ["uv_build>=0.9.17,<0.10.0"]
-build-backend = "uv_build"
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[tool.maturin]
+python-source = "."
+module-name = "mio_decomp._mio_decomp"
+features = ["pyo3/extension-module"]
 
 [tool.uv.build-backend]
 module-name = "mio_decomp"
 module-root = ""
+
+[dependency-groups]
+dev = [
+    "maturin>=1.12.6",
+]
