@@ -8,7 +8,7 @@ name = "mio_decomp"
 crate-type = ["cdylib"]
 
 [dependencies]
-pyo3      = { version = "0.28.2", features = ["extension-module"] }
+pyo3      = { version = "0.28.2", features = ["extension-module", "abi3-py313"] }
 bitflags  = "2"
 lz4_flex  = "0.11"
 zstd      = "0.13"
