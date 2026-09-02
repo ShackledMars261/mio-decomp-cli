@@ -10,11 +10,7 @@ jobs:
     name: Build wheels on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
 
-    environment:
-      name: pypi
-
     permissions:
-      id-token: write
       contents: read
 
     strategy:
@@ -25,23 +21,31 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Set up Python
+        id: py
         uses: actions/setup-python@v7
-        with: 
-          python-version: '3.13.11'
+        with:
+          python-version: '3.13'
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Set up uv
-        uses: astral-sh/setup-uv@v10.0.1
-
-      - name: Build wheels
+      # Linux: builds inside the manylinux container, so use the container's
+      # interpreter (the action puts everything under /opt/python on PATH).
+      - name: Build wheels (Linux)
+        if: runner.os == 'Linux'
         uses: PyO3/maturin-action@v1
         with:
           command: build
-          args: --release --out dist
-          # manylinux auto-selects the correct manylinux image on Linux
+          args: --release --out dist -i python3.13
           manylinux: auto
+
+      # macOS/Windows: builds on the host, so point at setup-python's interpreter.
+      - name: Build wheels (macOS/Windows)
+        if: runner.os != 'Linux'
+        uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          args: --release --out dist -i ${{ steps.py.outputs.python-path }}
 
       - name: Upload wheels
         uses: actions/upload-artifact@v4
